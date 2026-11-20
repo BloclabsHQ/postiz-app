@@ -167,6 +167,70 @@ function safeStringify(obj: any) {
   });
 }
 
+export const PROVIDER_ERROR_BODY_LOG_LIMIT = 2_048;
+
+const REDACT_SENSITIVE_ERROR_PATTERN =
+  /("?(?:authorization|cookie|access_token|refresh_token|oauth_[a-z0-9_]+|bearer)"?\s*[:=]\s*)"[^"]*"|(Bearer\s+)[^\s"',]+/gi;
+
+export function extractHttpErrorStatus(err: any): number | undefined {
+  for (const candidate of [err?.code, err?.status, err?.response?.status]) {
+    const status =
+      typeof candidate === 'string' ? parseInt(candidate, 10) : candidate;
+    if (
+      typeof status === 'number' &&
+      Number.isFinite(status) &&
+      status >= 100 &&
+      status < 600
+    ) {
+      return status;
+    }
+  }
+
+  return undefined;
+}
+
+export function extractHttpErrorBody(err: any): string {
+  if (err?.data !== undefined && err?.data !== null) {
+    if (typeof err.data === 'string') {
+      return err.data;
+    }
+
+    return safeStringify(err.data);
+  }
+
+  const responseData = err?.response?.data;
+  if (responseData !== undefined && responseData !== null) {
+    if (typeof responseData === 'string') {
+      return responseData;
+    }
+
+    return safeStringify(responseData);
+  }
+
+  if (typeof err?.message === 'string' && err.message) {
+    return err.message;
+  }
+
+  return safeStringify(err);
+}
+
+export function redactProviderErrorBody(
+  body: string,
+  max = PROVIDER_ERROR_BODY_LOG_LIMIT
+): string {
+  const redacted = body.replace(
+    REDACT_SENSITIVE_ERROR_PATTERN,
+    (_match, _quoted, bearerPrefix) =>
+      bearerPrefix ? `${bearerPrefix}[REDACTED]` : '"[REDACTED]"'
+  );
+
+  if (redacted.length <= max) {
+    return redacted;
+  }
+
+  return `${redacted.slice(0, max)}… [truncated]`;
+}
+
 export abstract class SocialAbstract {
   abstract identifier: string;
   maxConcurrentJob = 1;
@@ -576,7 +640,14 @@ export abstract class SocialAbstract {
       ) {
         throw err;
       }
-      const handle = this.handleErrors(safeStringify(err), 200);
+      const status = extractHttpErrorStatus(err) ?? 200;
+      const body = extractHttpErrorBody(err);
+      if (this.identifier === 'x') {
+        console.log(
+          `X API error (status ${status}): ${redactProviderErrorBody(body)}`
+        );
+      }
+      const handle = this.handleErrors(body, status);
       value = { err: true, value: 'Unknown Error', ...(handle || {}) };
       globalErr = err;
     }

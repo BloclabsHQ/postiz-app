@@ -149,7 +149,10 @@ export class XProvider extends SocialAbstract implements SocialProvider {
     return true;
   }
 
-  override handleErrors(body: string):
+  override handleErrors(
+    body: string,
+    status = 200
+  ):
     | {
         type: 'refresh-token' | 'bad-body' | 'retry';
         value: string;
@@ -294,6 +297,50 @@ export class XProvider extends SocialAbstract implements SocialProvider {
       return {
         type: 'refresh-token',
         value: 'X rejected the connected account, please reconnect your account',
+      };
+    }
+    if (
+      body.toLowerCase().includes('invalid media type') ||
+      body.includes('InvalidMediaType') ||
+      body.includes('UNSUPPORTED_MEDIA')
+    ) {
+      return {
+        type: 'bad-body',
+        value:
+          'X does not support this media type, use JPEG, PNG, GIF, or MP4',
+      };
+    }
+    if (status === 402) {
+      return {
+        type: 'bad-body',
+        value:
+          'X API credits are depleted, add credits in the X developer portal and try again',
+      };
+    }
+    if (status === 401) {
+      return {
+        type: 'refresh-token',
+        value:
+          'X access token is expired or invalid, reconnect your X channel',
+      };
+    }
+    if (status === 403) {
+      return {
+        type: 'bad-body',
+        value:
+          'X rejected this request (missing permission, duplicate content, or forbidden post)',
+      };
+    }
+    if (status === 429) {
+      return {
+        type: 'retry',
+        value: 'X rate limit reached, please wait a few minutes and try again',
+      };
+    }
+    if (status === 413) {
+      return {
+        type: 'bad-body',
+        value: 'The media file is too large for X',
       };
     }
     return undefined;
@@ -940,7 +987,7 @@ export class XProvider extends SocialAbstract implements SocialProvider {
         // suspended accounts fail properly instead of burning the whole check
         // budget as "transient".
         const body = JSON.stringify(err?.data || {});
-        const handleError = this.handleErrors(body);
+        const handleError = this.handleErrors(body, err?.code ?? 200);
 
         if (err?.code === 401 || handleError?.type === 'refresh-token') {
           throw new RefreshToken(this.identifier, body, Buffer.from('{}'));
