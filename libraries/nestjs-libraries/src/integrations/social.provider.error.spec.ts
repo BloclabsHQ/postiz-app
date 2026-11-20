@@ -1,11 +1,13 @@
 import {
   BadBody,
+  buildRunInConcurrentHandleErrorsInput,
   extractHttpErrorBody,
   extractHttpErrorStatus,
   PROVIDER_ERROR_BODY_LOG_LIMIT,
   redactProviderErrorBody,
   SocialAbstract,
 } from '@gitroom/nestjs-libraries/integrations/social.abstract';
+import { TumblrProvider } from '@gitroom/nestjs-libraries/integrations/social/tumblr.provider';
 
 describe('provider HTTP error helpers', () => {
   it('extracts status from twitter-api-v2 style errors', () => {
@@ -33,20 +35,67 @@ describe('provider HTTP error helpers', () => {
     expect(body).toContain('402');
   });
 
-  it('redacts bearer tokens and caps log size', () => {
-    const raw =
-      '{"authorization":"Bearer secret-token.example","detail":"credits depleted"}';
+  it.each([
+    [
+      '{"authorization":"Bearer secret-token.example","detail":"credits depleted"}',
+      'secret-token.example',
+    ],
+    ['oauth_token=oauth-value.test&oauth_token_secret=oauth-secret.test', 'oauth-value.test'],
+    ['access_token=plain-access.test&foo=bar', 'plain-access.test'],
+    ['{"token":"json-token.test","consumer_key":"consumer-key.test"}', 'json-token.test'],
+  ])('redacts sensitive values (%#)', (raw, leaked) => {
     const redacted = redactProviderErrorBody(raw);
-    expect(redacted).not.toContain('secret-token.example');
+    expect(redacted).not.toContain(leaked);
     expect(redacted).toContain('[REDACTED]');
+  });
 
+  it('caps redacted log size', () => {
     const longBody = 'x'.repeat(PROVIDER_ERROR_BODY_LOG_LIMIT + 50);
     expect(redactProviderErrorBody(longBody)).toContain('… [truncated]');
   });
 });
 
-class StatusPassThroughProvider extends SocialAbstract {
-  identifier = 'test';
+describe('buildRunInConcurrentHandleErrorsInput', () => {
+  const twitterErr = {
+    code: 402,
+    message: 'Request failed',
+    data: { detail: 'credits depleted', status: 402 },
+  };
+
+  it('keeps safeStringify(err) and status 200 for non-X providers', () => {
+    const { body, status } = buildRunInConcurrentHandleErrorsInput(
+      twitterErr,
+      'youtube'
+    );
+
+    expect(status).toBe(200);
+    expect(body).toContain('Request failed');
+    expect(body).toContain('credits depleted');
+  });
+
+  it('passes real HTTP status only for the X provider', () => {
+    expect(buildRunInConcurrentHandleErrorsInput(twitterErr, 'x').status).toBe(
+      402
+    );
+    expect(
+      buildRunInConcurrentHandleErrorsInput(twitterErr, 'tumblr').status
+    ).toBe(200);
+  });
+
+  it('appends extracted API payload for X when it is not already in the stringified error', () => {
+    const err = {
+      code: 402,
+      message: 'wrapper',
+      data: { detail: 'credits depleted' },
+    };
+    const { body } = buildRunInConcurrentHandleErrorsInput(err, 'x');
+    expect(body).toContain('wrapper');
+    expect(body).toContain('credits depleted');
+  });
+});
+
+class XStatusPassThroughProvider extends SocialAbstract {
+  identifier = 'x';
   captured: { body: string; status: number }[] = [];
 
   override handleErrors(body: string, status: number) {
@@ -62,9 +111,23 @@ class StatusPassThroughProvider extends SocialAbstract {
   }
 }
 
+class NonXMessageProvider extends SocialAbstract {
+  identifier = 'youtube';
+  captured: { body: string; status: number }[] = [];
+
+  override handleErrors(body: string, status: number) {
+    this.captured.push({ body, status });
+    if (body.includes('invalidTags')) {
+      return { type: 'bad-body' as const, value: 'tags invalid' };
+    }
+
+    return undefined;
+  }
+}
+
 describe('SocialAbstract.runInConcurrent', () => {
-  it('passes real HTTP status into handleErrors', async () => {
-    const provider = new StatusPassThroughProvider();
+  it('passes real HTTP status into handleErrors for X', async () => {
+    const provider = new XStatusPassThroughProvider();
 
     await expect(
       provider.runInConcurrent(async () => {
@@ -87,16 +150,41 @@ describe('SocialAbstract.runInConcurrent', () => {
     ]);
   });
 
-  it('defaults to status 200 when the thrown error has no status', async () => {
-    const provider = new StatusPassThroughProvider();
+  it('keeps stringified errors and status 200 for other providers', async () => {
+    const provider = new NonXMessageProvider();
 
     await expect(
       provider.runInConcurrent(async () => {
-        throw new Error('unexpected');
+        throw {
+          code: 429,
+          message: 'invalidTags in request',
+          data: { detail: 'rate limited' },
+        };
       })
     ).rejects.toBeInstanceOf(BadBody);
 
     expect(provider.captured[0].status).toBe(200);
+    expect(provider.captured[0].body).toContain('invalidTags in request');
+  });
+
+  it('does not change Tumblr handleErrors outcome for rate-limit errors in runInConcurrent', () => {
+    const tumblr = new TumblrProvider();
+    const err = {
+      code: 429,
+      message: 'rate limited',
+      data: { errors: [] as string[] },
+    };
+    const legacy = tumblr.handleErrors(
+      JSON.stringify(err),
+      200
+    )?.type;
+    const concurrent = tumblr.handleErrors(
+      buildRunInConcurrentHandleErrorsInput(err, 'tumblr').body,
+      buildRunInConcurrentHandleErrorsInput(err, 'tumblr').status
+    )?.type;
+
+    expect(legacy).toBe(concurrent);
+    expect(legacy).toBeUndefined();
   });
 });
 

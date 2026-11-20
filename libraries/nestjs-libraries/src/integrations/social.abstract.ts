@@ -169,8 +169,23 @@ function safeStringify(obj: any) {
 
 export const PROVIDER_ERROR_BODY_LOG_LIMIT = 2_048;
 
-const REDACT_SENSITIVE_ERROR_PATTERN =
-  /("?(?:authorization|cookie|access_token|refresh_token|oauth_[a-z0-9_]+|bearer)"?\s*[:=]\s*)"[^"]*"|(Bearer\s+)[^\s"',]+/gi;
+const SENSITIVE_ERROR_VALUE_KEYS =
+  'authorization|cookie|access_token|refresh_token|oauth_token|oauth_token_secret|oauth_[a-z0-9_]+|consumer_key|consumer_secret|token|bearer';
+
+const REDACT_JSON_VALUE_PATTERN = new RegExp(
+  `("(?:${SENSITIVE_ERROR_VALUE_KEYS})"\\s*:\\s*)"[^"]*"`,
+  'gi'
+);
+
+const REDACT_FORM_VALUE_PATTERN = new RegExp(
+  `(\\b(?:${SENSITIVE_ERROR_VALUE_KEYS})=)[^&\\s"'\\]]+`,
+  'gi'
+);
+
+const REDACT_PLAIN_VALUE_PATTERN = new RegExp(
+  `\\b(?:${SENSITIVE_ERROR_VALUE_KEYS})\\s*[:=]\\s*[^\\s"',&\\]]+`,
+  'gi'
+);
 
 export function extractHttpErrorStatus(err: any): number | undefined {
   for (const candidate of [err?.code, err?.status, err?.response?.status]) {
@@ -214,15 +229,41 @@ export function extractHttpErrorBody(err: any): string {
   return safeStringify(err);
 }
 
+export function buildRunInConcurrentHandleErrorsInput(
+  err: any,
+  identifier: string
+): { body: string; status: number } {
+  const serialized = safeStringify(err);
+  if (identifier !== 'x') {
+    return { body: serialized, status: 200 };
+  }
+
+  const status = extractHttpErrorStatus(err) ?? 200;
+  const extracted = extractHttpErrorBody(err);
+  let body = serialized;
+  if (
+    extracted &&
+    extracted !== serialized &&
+    !serialized.includes(extracted)
+  ) {
+    body = `${serialized}\n${extracted}`;
+  }
+
+  return { body, status };
+}
+
 export function redactProviderErrorBody(
   body: string,
   max = PROVIDER_ERROR_BODY_LOG_LIMIT
 ): string {
-  const redacted = body.replace(
-    REDACT_SENSITIVE_ERROR_PATTERN,
-    (_match, _quoted, bearerPrefix) =>
-      bearerPrefix ? `${bearerPrefix}[REDACTED]` : '"[REDACTED]"'
-  );
+  let redacted = body.replace(REDACT_JSON_VALUE_PATTERN, '$1"[REDACTED]"');
+  redacted = redacted.replace(REDACT_FORM_VALUE_PATTERN, '$1[REDACTED]');
+  redacted = redacted.replace(REDACT_PLAIN_VALUE_PATTERN, (match) => {
+    const sep = match.includes('=') ? '=' : ':';
+    const [key] = match.split(sep);
+    return `${key}${sep}[REDACTED]`;
+  });
+  redacted = redacted.replace(/(Bearer\s+)[^\s"',&]+/gi, '$1[REDACTED]');
 
   if (redacted.length <= max) {
     return redacted;
@@ -640,11 +681,14 @@ export abstract class SocialAbstract {
       ) {
         throw err;
       }
-      const status = extractHttpErrorStatus(err) ?? 200;
-      const body = extractHttpErrorBody(err);
+      const { body, status } = buildRunInConcurrentHandleErrorsInput(
+        err,
+        this.identifier
+      );
       if (this.identifier === 'x') {
+        const logBody = extractHttpErrorBody(err) || body;
         console.log(
-          `X API error (status ${status}): ${redactProviderErrorBody(body)}`
+          `X API error (status ${status}): ${redactProviderErrorBody(logBody)}`
         );
       }
       const handle = this.handleErrors(body, status);
